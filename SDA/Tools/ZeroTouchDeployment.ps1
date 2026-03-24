@@ -105,8 +105,14 @@ function Save-Lib {
 }
 
 if ($Action -eq "GetLibrary") {
-    $lib = Load-Lib
-    $lib | ConvertTo-Json -Depth 2 | Write-Output
+    $lib = @(Load-Lib)
+    $json = ConvertTo-Json -InputObject $lib -Depth 2 -Compress
+
+    if ($lib.Count -eq 1 -and $json -notmatch "^\[") {
+        $json = "[$json]"
+    }
+
+    Write-Output $json
     return
 }
 
