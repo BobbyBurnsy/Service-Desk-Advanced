@@ -54,7 +54,7 @@ SDA requires the following ports to be open **inbound to the endpoints, but ONLY
 ## 3. Installation & Deployment Guide
 
 ### What are the prerequisites for running the console?
-Technicians running the console must have the **RSAT: Active Directory Domain Services** tools installed, as well as the **Microsoft Graph API** PowerShell modules. 
+Technicians running the console must have the **RSAT: Active Directory Domain Services** tools installed.  For the entra/intune tools to work properly, they must also have the **Microsoft Graph API** PowerShell modules. 
 
 ### How do I set up a new technician's workstation?
 Simply have the technician right-click and run `Install-SDADependencies.ps1` as Administrator. This bootstrapper will automatically enforce TLS 1.2, configure the local execution policy, trust the PSGallery, and install all required Microsoft Graph modules.
@@ -68,7 +68,7 @@ SDA utilizes protocols like WinRM and PsExec to interact with remote `C$` shares
 
 ### How does SDA know which computer a user is logged into?
 SDA uses a hybrid "Pull and Link" telemetry philosophy:
-1. **The Background Sweep:** You schedule `NetworkAssetTracker.ps1` to run bi-weekly on a management server. It queries AD for all active workstations, pings them, and uses WMI to ask, *"Who is logged into you right now?"* It saves this data to `UserHistory.json`.
+1. **The Background Sweep:** Schedule `NetworkAssetTracker.ps1` to run bi-weekly on a management server, or launch the script directly from the console at your leisure. It queries AD for all active workstations, pings them, and uses WMI to ask, *"Who is logged into you right now?"* It saves this data to `UserHistory.json`.
 2. **The Manual Link:** If a user is on a brand new PC that hasn't been swept yet, the technician simply asks for the PC name and clicks the **`+` (Link PC)** button in the UI. This instantly and permanently binds the user to the device in the database.
 
 ### How does the Active Directory Profiler work?
