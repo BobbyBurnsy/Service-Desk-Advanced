@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    SDA Web-Ready Tool: CustomScriptOrchestrator.ps1
+    SDA Web-Ready Tool: RemoteScriptExecutor.ps1
 .DESCRIPTION
     Acts as a backend controller for the Custom Script Library UI.
     Reads custom .ps1 scripts from a network share and executes them remotely
@@ -68,14 +68,15 @@ function Load-Lib {
         $default = @(
             [PSCustomObject]@{ ID=1; Name="Clear DNS Cache (Example)"; Path="\\server\share\Scripts\ClearDNS.ps1" }
         )
-        $default | ConvertTo-Json -Depth 2 | Set-Content $LibraryFile -Force
+        ConvertTo-Json -InputObject $default -Depth 2 -Compress | Set-Content $LibraryFile -Force
         return $default
     }
 }
 
 function Save-Lib {
     param($d)
-    $d | ConvertTo-Json -Depth 2 | Set-Content $LibraryFile -Force
+    # FIX: Use -InputObject to prevent pipeline unrolling when saving
+    ConvertTo-Json -InputObject @($d) -Depth 2 -Compress | Set-Content $LibraryFile -Force
 }
 
 # --- UI Library Management ---
@@ -83,6 +84,7 @@ if ($Action -eq "GetLibrary") {
     $lib = @(Load-Lib)
     $json = ConvertTo-Json -InputObject $lib -Depth 2 -Compress
 
+    # FIX: Prevent PS5.1 from stripping array brackets on single items
     if ($lib.Count -eq 1 -and $json -notmatch "^\[") {
         $json = "[$json]"
     }
@@ -92,7 +94,7 @@ if ($Action -eq "GetLibrary") {
 }
 
 if ($Action -eq "AddScript") {
-    $lib = Load-Lib
+    $lib = @(Load-Lib) # FIX: Force array so += works
     $newID = if ($lib.Count -gt 0) { ([int]($lib | Select-Object -ExpandProperty ID | Measure-Object -Maximum).Maximum) + 1 } else { 1 }
     $lib += [PSCustomObject]@{ ID=$newID; Name=$ScriptName.Trim(); Path=$ScriptPath.Trim() }
     Save-Lib $lib
@@ -103,7 +105,7 @@ if ($Action -eq "AddScript") {
 }
 
 if ($Action -eq "DeleteScript") {
-    $lib = Load-Lib
+    $lib = @(Load-Lib) # FIX: Force array
     $lib = $lib | Where-Object { $_.ID -ne [int]$ScriptID }
     Save-Lib $lib
     Write-Output "[SDA] [-] Script removed from the Custom Script Library."

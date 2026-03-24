@@ -94,20 +94,22 @@ function Load-Lib {
         $default = @(
             [PSCustomObject]@{ ID=1; Name="Google Chrome (Enterprise)"; Path="\\server\share\Software\GoogleChromeStandaloneEnterprise64.msi"; Args="/qn /norestart" }
         )
-        $default | ConvertTo-Json -Depth 2 | Set-Content $LibraryFile -Force
+        ConvertTo-Json -InputObject $default -Depth 2 -Compress | Set-Content $LibraryFile -Force
         return $default
     }
 }
 
 function Save-Lib {
     param($d)
-    $d | ConvertTo-Json -Depth 2 | Set-Content $LibraryFile -Force
+    # FIX: Use -InputObject to prevent pipeline unrolling when saving
+    ConvertTo-Json -InputObject @($d) -Depth 2 -Compress | Set-Content $LibraryFile -Force
 }
 
 if ($Action -eq "GetLibrary") {
     $lib = @(Load-Lib)
     $json = ConvertTo-Json -InputObject $lib -Depth 2 -Compress
 
+    # FIX: Prevent PS5.1 from stripping array brackets on single items
     if ($lib.Count -eq 1 -and $json -notmatch "^\[") {
         $json = "[$json]"
     }
@@ -117,7 +119,7 @@ if ($Action -eq "GetLibrary") {
 }
 
 if ($Action -eq "AddApp") {
-    $lib = Load-Lib
+    $lib = @(Load-Lib) # FIX: Force array so += works
     $newID = if ($lib.Count -gt 0) { ([int]($lib | Select-Object -ExpandProperty ID | Measure-Object -Maximum).Maximum) + 1 } else { 1 }
     $lib += [PSCustomObject]@{ ID=$newID; Name=$AppName.Trim(); Path=$AppPath.Trim(); Args=$AppArgs.Trim() }
     Save-Lib $lib
@@ -126,7 +128,7 @@ if ($Action -eq "AddApp") {
 }
 
 if ($Action -eq "DeleteApp") {
-    $lib = Load-Lib
+    $lib = @(Load-Lib) # FIX: Force array
     $lib = $lib | Where-Object { $_.ID -ne [int]$AppID }
     Save-Lib $lib
     Write-Output "[SDA] [-] Application removed from the central Software Library."
