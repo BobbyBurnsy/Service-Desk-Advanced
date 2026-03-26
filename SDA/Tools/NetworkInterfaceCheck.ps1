@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    SDA Web-Ready Tool: NetworkInterfaceDiagnostics.ps1
+    SDA Web-Ready Tool: NetworkInterfaceCheck.ps1
 .DESCRIPTION
     Remotely queries the target for active network adapters (Status=Up).
     It filters out loopback/APIPA addresses and correlates IPv4 addresses with
