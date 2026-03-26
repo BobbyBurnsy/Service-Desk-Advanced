@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    SDA Web-Ready Tool: OutOfBandDataPreservation.ps1
+    SDA Web-Ready Tool: BookmarkBackup.ps1
 .DESCRIPTION
     Securely extracts Google Chrome and Microsoft Edge bookmarks for a specified AD user.
     Strictly targets the \Default profile. Bypasses SMB/File Sharing firewalls by reading 
