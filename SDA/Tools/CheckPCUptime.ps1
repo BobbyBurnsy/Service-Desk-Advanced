@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    SDA Web-Ready Tool: SystemUptimeVerification.ps1
+    SDA Web-Ready Tool: CheckPCUptime.ps1
 .DESCRIPTION
     Queries the remote computer's WMI/CIM repository for Win32_OperatingSystem
     to calculate the exact Last Boot Up Time and current Uptime.
