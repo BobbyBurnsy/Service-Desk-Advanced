@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    SDA Web-Ready Tool: LocalPrivilegeAuditing.ps1
+    SDA Web-Ready Tool: LocalAdminAudit.ps1
 .DESCRIPTION
     Remotely queries the target computer to list all members of the local
     "Administrators" group, displaying their Name, Type (User/Group), and Source (Local/AD).
