@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    SDA Web-Ready Tool: SCCMAgentRestart.ps1
+    SDA Web-Ready Tool: RestartSCCMAgent.ps1
 .DESCRIPTION
     Remotely restarts the SCCM Agent service (CcmExec).
     Includes a 4-second delay to ensure log file locks are released gracefully.
