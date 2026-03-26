@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    SDA Web-Ready Tool: ZeroTouchDeployment.ps1
+    SDA Web-Ready Tool: emoteSoftwareInstall.ps1
 .DESCRIPTION
     Acts as a backend controller for the Zero-Touch Deployment Library UI.
     Supports single and mass deployments via WinRM and PsExec.
