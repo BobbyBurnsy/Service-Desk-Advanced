@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    SDA Web-Ready Tool: DeepStorageCleanup.ps1
+    SDA Web-Ready Tool: StorageCleanup.ps1
 .DESCRIPTION
     A heavy-duty storage cleanup tool. Calculates free space, silently clears 
     the MECM (SCCM) cache, force-empties Windows Temp, all User Temp folders, 
