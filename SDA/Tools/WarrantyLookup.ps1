@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    SDA Web-Ready Tool: AutomatedWarrantyRouting.ps1
+    SDA Web-Ready Tool: WarrantyLookup.ps1
 .DESCRIPTION
     Queries the target computer's WMI/CIM repository for its Make and Serial Number,
     then automatically constructs the correct vendor support/warranty webpage URL.
