@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    SDA Web-Ready Tool: BackgroundPolicyEnforcement.ps1
+    SDA Web-Ready Tool: RemoteGPUpdate.ps1
 .DESCRIPTION
     Remotely triggers a forced Group Policy update (Computer policy only)
     on the target machine. Uses /wait:0 to ensure the command returns instantly.
