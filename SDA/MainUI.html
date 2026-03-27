@@ -207,26 +207,26 @@
         <div class="bottom-row">
             <h3 style="margin-bottom: 12px; color: var(--text-secondary); font-size: 1rem;"><i class="fa-solid fa-toolbox"></i> Endpoint Remediation & Diagnostics</h3>
             <div style="display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 10px;">
-                <button class="action-btn" onclick="executeTool('SystemUptimeCheck.ps1')"><i class="fa-solid fa-clock"></i> Uptime Check</button>
-                <button class="action-btn" onclick="executeTool('NetworkInterfaceDiagnostics.ps1')"><i class="fa-solid fa-network-wired"></i> Network Interfaces</button>
-                <button class="action-btn" onclick="executeTool('LocalPrivilegeAuditing.ps1')"><i class="fa-solid fa-user-shield"></i> Local Admins</button>
+                <button class="action-btn" onclick="executeTool('CheckPCUptime.ps1')"><i class="fa-solid fa-clock"></i> Uptime Check</button>
+                <button class="action-btn" onclick="executeTool('NetworkInterfaceCheck.ps1')"><i class="fa-solid fa-network-wired"></i> Network Interfaces</button>
+                <button class="action-btn" onclick="executeTool('LocalAdminAudit.ps1')"><i class="fa-solid fa-user-shield"></i> Local Admins</button>
                 <button class="action-btn" onclick="promptEventLogs()"><i class="fa-solid fa-file-lines"></i> Event Logs</button>
                 <button class="action-btn" onclick="promptSoftwareInventory()"><i class="fa-solid fa-box-open"></i> Installed Software</button>
                 <button class="action-btn" onclick="executeTool('BitLockerStatus.ps1')"><i class="fa-solid fa-lock"></i> BitLocker Status</button>
                 <button class="action-btn" onclick="executeTool('BatteryHealthAnalyzer.ps1')"><i class="fa-solid fa-battery-half"></i> Battery Health</button>
-                <button class="action-btn" onclick="executeTool('AutomatedWarrantyLookup.ps1')"><i class="fa-solid fa-laptop-medical"></i> Warranty Lookup</button>
+                <button class="action-btn" onclick="executeTool('WarrantyLookup.ps1')"><i class="fa-solid fa-laptop-medical"></i> Warranty Lookup</button>
 
                 <button class="action-btn" onclick="executeTool('PrintQueueReset.ps1')"><i class="fa-solid fa-print"></i> Print Queue Reset</button>
                 <button class="action-btn" onclick="executeTool('RemoteGPUpdate.ps1')"><i class="fa-solid fa-sync"></i> Remote GPUpdate</button>
-                <button class="action-btn" onclick="executeTool('SCCMAgentRestart.ps1')"><i class="fa-solid fa-server"></i> SCCM Restart</button>
+                <button class="action-btn" onclick="executeTool('RestartSCCMAgent.ps1')"><i class="fa-solid fa-server"></i> SCCM Restart</button>
                 <button class="action-btn" onclick="executeTool('EnableRemoteDesktop.ps1')"><i class="fa-solid fa-desktop"></i> Enable RDP</button>
                 <button class="action-btn" onclick="executeTool('DNSNetworkRefresh.ps1')"><i class="fa-solid fa-globe"></i> DNS Refresh</button>
-                <button class="action-btn" onclick="executeTool('OutOfBandDataPreservation.ps1')"><i class="fa-solid fa-bookmark"></i> Bookmark Backup</button>
+                <button class="action-btn" onclick="executeTool('BookmarkBackup.ps1')"><i class="fa-solid fa-bookmark"></i> Bookmark Backup</button>
 
                 <button class="action-btn danger" onclick="executeTool('BrowserProfileReset.ps1')"><i class="fa-brands fa-chrome"></i> Browser Reset</button>
                 <button class="action-btn danger" onclick="openRemoteInstallModal()"><i class="fa-solid fa-download"></i> Zero-Touch Deploy</button>
                 <button class="action-btn danger" onclick="openCustomScriptModal()"><i class="fa-solid fa-scroll"></i> Script Executor</button>
-                <button class="action-btn danger" onclick="executeTool('DeepStorageCleanup.ps1')"><i class="fa-solid fa-broom"></i> Storage Cleanup</button>
+                <button class="action-btn danger" onclick="executeTool('StorageCleanup.ps1')"><i class="fa-solid fa-broom"></i> Storage Cleanup</button>
                 <button class="action-btn danger" onclick="executeTool('RemotePowerControls.ps1', { PowerAction: 'Restart' })"><i class="fa-solid fa-power-off"></i> Graceful Restart</button>
                 <button class="action-btn danger" onclick="executeTool('RemotePowerControls.ps1', { PowerAction: 'ForceRestart' })"><i class="fa-solid fa-skull"></i> Force Restart</button>
                 <button class="action-btn danger" onclick="executeTool('RemotePowerControls.ps1', { PowerAction: 'Logoff' })"><i class="fa-solid fa-user-slash"></i> Force Logoff</button>
@@ -656,7 +656,7 @@
 				const response = await fetch('/api/tools/execute', {
 					method: 'POST',
 					headers: { 'Content-Type': 'application/json' },
-					body: JSON.stringify({ Script: 'ZeroTouchDeployment.ps1', ExtraArgs: { Action: 'GetLibrary' } })
+					body: JSON.stringify({ Script: 'RemoteSoftwareInstall.ps1', ExtraArgs: { Action: 'GetLibrary' } })
 				});
 				const data = await response.json();
 
@@ -698,7 +698,7 @@
 			await fetch('/api/tools/execute', {
 				method: 'POST',
 				headers: { 'Content-Type': 'application/json' },
-				body: JSON.stringify({ Script: 'ZeroTouchDeployment.ps1', ExtraArgs: { Action: 'AddApp', AppName: name, AppPath: path, AppArgs: args } })
+				body: JSON.stringify({ Script: 'RemoteSoftwareInstall.ps1', ExtraArgs: { Action: 'AddApp', AppName: name, AppPath: path, AppArgs: args } })
 			});
 
 			document.getElementById('newAppName').value = "";
@@ -713,7 +713,7 @@
 			await fetch('/api/tools/execute', {
 				method: 'POST',
 				headers: { 'Content-Type': 'application/json' },
-				body: JSON.stringify({ Script: 'ZeroTouchDeployment.ps1', ExtraArgs: { Action: 'DeleteApp', AppID: id } })
+				body: JSON.stringify({ Script: 'RemoteSoftwareInstall.ps1', ExtraArgs: { Action: 'DeleteApp', AppID: id } })
 			});
 			openRemoteInstallModal();
 		}
@@ -729,7 +729,7 @@
 
 			const isTrainingMode = document.getElementById('trainingModeToggle').checked;
 			if (isTrainingMode) {
-				executeTool('ZeroTouchDeployment.ps1', { Action: 'Install', AppName: name, AppPath: path, AppArgs: args }, cleanTargets);
+				executeTool('RemoteSoftwareInstall.ps1', { Action: 'Install', AppName: name, AppPath: path, AppArgs: args }, cleanTargets);
 				return;
 			}
 
@@ -740,7 +740,7 @@
 					method: 'POST',
 					headers: { 'Content-Type': 'application/json' },
 					body: JSON.stringify({ 
-						Script: 'ZeroTouchDeployment.ps1', 
+						Script: 'RemoteSoftwareInstall.ps1', 
 						Target: cleanTargets, 
 						TargetUser: currentTargetUser, 
 						ExtraArgs: { Action: 'Install', AppName: name, AppPath: path, AppArgs: args } 
