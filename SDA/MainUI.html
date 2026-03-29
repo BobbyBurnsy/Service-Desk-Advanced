@@ -606,7 +606,7 @@
                 }
             });
 
-            // Event Delegation for dynamically generated library tables
+            // Event Delegation for dynamically generated library tables and copy buttons
             document.addEventListener('click', e => {
                 const deployAppBtn = e.target.closest('.deploy-app-btn');
                 if (deployAppBtn) {
@@ -623,6 +623,10 @@
                 const deleteScriptBtn = e.target.closest('.delete-script-btn');
                 if (deleteScriptBtn) {
                     deleteCustomScript(deleteScriptBtn.dataset.id);
+                }
+                const copySecretBtn = e.target.closest('.copy-secret-btn');
+                if (copySecretBtn) {
+                    copyToClipboard(copySecretBtn.dataset.value, copySecretBtn);
                 }
             });
 
