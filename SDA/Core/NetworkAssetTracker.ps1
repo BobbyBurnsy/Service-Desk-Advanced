@@ -63,7 +63,33 @@ Write-Host " [i] Scope: Active Windows 10/11 Workstations" -ForegroundColor Dark
 Write-Host " [i] Mode: Additive (Preserves existing history)`n" -ForegroundColor DarkGray
 
 # ==============================================================================
-# 2. LOAD EXISTING DATABASE (With Composite Key Fix)
+# 2. HELPER FUNCTIONS
+# ==============================================================================
+function Save-Database {
+    param($db, $initialCount, $historyFile, $tempFile)
+
+    if ($db.Count -ge $initialCount -and $db.Count -gt 0) {
+        try {
+            $list = @($db.Values | Sort-Object User)
+            $json = ConvertTo-Json -InputObject $list -Depth 3 -Compress -ErrorAction Stop
+
+            # PS 5.1 Single-Item Array Protection
+            if ($list.Count -eq 1 -and $json -notmatch "^\s*\[") { $json = "[$json]" }
+            if ([string]::IsNullOrWhiteSpace($json)) { throw "Empty JSON generated." }
+
+            Set-Content -Path $tempFile -Value $json -Force -ErrorAction Stop
+            Move-Item -Path $tempFile -Destination $historyFile -Force -ErrorAction Stop
+            return $true
+        } catch { 
+            if (Test-Path $tempFile) { Remove-Item $tempFile -Force -ErrorAction SilentlyContinue }
+            return $false 
+        }
+    }
+    return $false
+}
+
+# ==============================================================================
+# 3. LOAD EXISTING DATABASE (With Composite Key Fix)
 # ==============================================================================
 $masterDB = @{}
 $initialCount = 0
@@ -98,7 +124,7 @@ if (Test-Path $HistoryFile) {
 }
 
 # ==============================================================================
-# 3. GET COMPUTERS (Universal Workstation Filter)
+# 4. GET COMPUTERS (Universal Workstation Filter)
 # ==============================================================================
 Write-Host "`n [2/4] Fetching Computer List from Active Directory..." -ForegroundColor White
 
@@ -120,13 +146,14 @@ Write-Host "       [OK] Found $total target workstations." -ForegroundColor Gree
 Start-Sleep -Seconds 2
 
 # ==============================================================================
-# 4. SCAN LOOP (PS 5.1 .NET Ping & MAC Extraction)
+# 5. SCAN LOOP (PS 5.1 .NET Ping & MAC Extraction)
 # ==============================================================================
 Write-Host "`n [3/4] Initiating WMI Telemetry Sweep..." -ForegroundColor White
 
 $count = 0
 $newFinds = 0
 $updatedFinds = 0
+$wmiErrors = 0
 $pingSender = New-Object System.Net.NetworkInformation.Ping
 
 foreach ($pc in $computers) {
@@ -146,13 +173,19 @@ foreach ($pc in $computers) {
             $rawUser = $compInfo.UserName
 
             if ($rawUser) {
-                $cleanUser = ($rawUser -split "\\")[-1].Trim()
+                # Defense-in-Depth: Strip control characters and HTML injection vectors
+                $cleanUser = ($rawUser -split "\\")[-1].Trim() -replace '[\x00-\x1F"<>]', ''
                 $timeStamp = (Get-Date).ToString("yyyy-MM-dd HH:mm")
 
                 # Extract MAC Address for Wake-on-LAN (Agentless)
                 $macAddress = $null
                 try {
-                    $netAdapter = Get-CimInstance -ClassName Win32_NetworkAdapterConfiguration -ComputerName $pc -Filter "IPEnabled = 'True'" -ErrorAction SilentlyContinue | Select-Object -First 1
+                    # WoL Reliability Fix: Filter out known virtual/VPN adapters
+                    $netAdapter = Get-CimInstance -ClassName Win32_NetworkAdapterConfiguration -ComputerName $pc -Filter "IPEnabled = 'True'" -ErrorAction SilentlyContinue | 
+                        Where-Object { $_.Description -notmatch 'VPN|Virtual|TAP|Loopback|Tunnel|Hyper-V|VMware' } | 
+                        Sort-Object Index | 
+                        Select-Object -First 1
+
                     if ($netAdapter) { $macAddress = $netAdapter.MACAddress }
                 } catch {}
 
@@ -179,66 +212,45 @@ foreach ($pc in $computers) {
                     Write-Host "       [$percent%] NEW: $cleanUser found on $pc" -ForegroundColor Cyan
                 }
             }
-        } catch {}
+        } catch {
+            $wmiErrors++
+        }
     }
 
     # --- ATOMIC AUTO-SAVE (Every 50 items) ---
     if ($count % 50 -eq 0) {
-        if ($masterDB.Count -ge $initialCount -and $masterDB.Count -gt 0) {
-            try {
-                $finalList = @($masterDB.Values | Sort-Object User)
-                $jsonOutput = ConvertTo-Json -InputObject $finalList -Depth 3 -Compress -ErrorAction Stop
-
-                # PS 5.1 Single-Item Array Protection
-                if ($finalList.Count -eq 1 -and $jsonOutput -notmatch "^\s*\[") {
-                    $jsonOutput = "[$jsonOutput]"
-                }
-
-                if (-not [string]::IsNullOrWhiteSpace($jsonOutput)) {
-                    Set-Content -Path $TempFile -Value $jsonOutput -Force -ErrorAction Stop
-                    Move-Item -Path $TempFile -Destination $HistoryFile -Force -ErrorAction Stop
-                }
-            } catch {}
-        }
+        Save-Database -db $masterDB -initialCount $initialCount -historyFile $HistoryFile -tempFile $TempFile | Out-Null
     }
 }
 
 # ==============================================================================
-# 5. FINAL ATOMIC SAVE
+# 6. FINAL ATOMIC SAVE
 # ==============================================================================
 Write-Host "`n [4/4] Finalizing Database..." -ForegroundColor White
 
-# Final Safety Check: Database should create NEW records, never shrink.
+# Final Safety Check: Database should create NEW records, never shrink, and never be empty.
 if ($masterDB.Count -ge $initialCount -and $masterDB.Count -gt 0) {
-    try {
-        $finalList = @($masterDB.Values | Sort-Object User)
 
-        $jsonOutput = ConvertTo-Json -InputObject $finalList -Depth 3 -Compress -ErrorAction Stop
+    $saveSuccess = Save-Database -db $masterDB -initialCount $initialCount -historyFile $HistoryFile -tempFile $TempFile
 
-        if ($finalList.Count -eq 1 -and $jsonOutput -notmatch "^\s*\[") {
-            $jsonOutput = "[$jsonOutput]"
-        }
-
-        if ([string]::IsNullOrWhiteSpace($jsonOutput)) { throw "Generated JSON string was completely empty." }
-
-        Set-Content -Path $TempFile -Value $jsonOutput -Force -ErrorAction Stop
-        Move-Item -Path $TempFile -Destination $HistoryFile -Force -ErrorAction Stop
-
+    if ($saveSuccess) {
         Write-Host "`n=======================================================" -ForegroundColor Cyan
         Write-Host " [SDA SUCCESS] Network Map Complete!" -ForegroundColor Green
         Write-Host "=======================================================" -ForegroundColor Cyan
         Write-Host "   Total DB Entries: $($masterDB.Count)" -ForegroundColor White
         Write-Host "   New Connections:  $newFinds" -ForegroundColor Cyan
         Write-Host "   Refreshed:        $updatedFinds" -ForegroundColor DarkGray
-        Write-Host "`n You may now close this window and return to the console." -ForegroundColor Yellow
-    } catch {
-        Write-Host "       [ERROR] Could not save file: $($_.Exception.Message)" -ForegroundColor Red
-        if (Test-Path $TempFile) { Remove-Item $TempFile -Force -ErrorAction SilentlyContinue }
+        if ($wmiErrors -gt 0) {
+            Write-Host "   WMI Failures:     $wmiErrors (RPC Blocked/Access Denied)" -ForegroundColor Yellow
+        }
+        Write-Host "`n You may now close this window and return to the console." -ForegroundColor White
+    } else {
+        Write-Host "       [ERROR] Could not save file. Check permissions on \Core directory." -ForegroundColor Red
     }
 } else {
-    Write-Host "       [PROTECTION] Scan resulted in data loss ($($masterDB.Count) vs $initialCount)." -ForegroundColor Yellow
+    Write-Host "       [PROTECTION] Scan resulted in data loss ($($masterDB.Count) vs $initialCount) or empty DB." -ForegroundColor Yellow
     Write-Host "       Save aborted. Restoring backup..." -ForegroundColor Yellow
-    Copy-Item $BackupFile $HistoryFile -Force
+    if (Test-Path $BackupFile) { Copy-Item $BackupFile $HistoryFile -Force }
 }
 
 Write-Host ""
