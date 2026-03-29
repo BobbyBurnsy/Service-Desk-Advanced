@@ -38,7 +38,12 @@ param(
 
 $ErrorActionPreference = "Continue"
 
-# --- Export Training Data ---
+# --- Helper Functions ---
+function Escape-Html([string]$s) {
+    if ([string]::IsNullOrEmpty($s)) { return "" }
+    return $s.Replace('&', '&amp;').Replace('<', '&lt;').Replace('>', '&gt;').Replace('"', '&quot;').Replace("'", '&#39;')
+}
+
 if ($GetTrainingData) {
     $data = @{
         StepName = "CUSTOM SCRIPT ORCHESTRATOR"
@@ -50,6 +55,12 @@ if ($GetTrainingData) {
     return
 }
 
+# --- Path Resolution Fallback ---
+if ([string]::IsNullOrWhiteSpace($SharedRoot)) {
+    $ScriptDir = Split-Path -Path $MyInvocation.MyCommand.Path
+    $SharedRoot = Split-Path -Path $ScriptDir
+}
+
 # --- Library Management ---
 $LibraryFile = Join-Path -Path $SharedRoot -ChildPath "Core\ScriptLibrary.json"
 
@@ -59,24 +70,25 @@ function Load-Lib {
             $raw = Get-Content $LibraryFile -Raw -ErrorAction Stop | ConvertFrom-Json
             if ($null -eq $raw) { return @() }
             if ($raw -is [System.Array]) { return $raw } else { return @($raw) }
-        } catch { return @() }
+        } catch { 
+            # Process Stability Fix: Throw instead of exit to prevent killing the API Gateway
+            throw "CRITICAL: ScriptLibrary.json is corrupted. Aborting to prevent data loss."
+        }
     } else { 
-        # Ensure Core directory exists before writing default
         $CoreDir = Join-Path -Path $SharedRoot -ChildPath "Core"
         if (-not (Test-Path $CoreDir)) { New-Item -ItemType Directory -Path $CoreDir -Force | Out-Null }
 
         $default = @(
             [PSCustomObject]@{ ID=1; Name="Clear DNS Cache (Example)"; Path="\\server\share\Scripts\ClearDNS.ps1" }
         )
-        ConvertTo-Json -InputObject $default -Depth 2 -Compress | Set-Content $LibraryFile -Force
+        ConvertTo-Json -InputObject $default -Depth 2 | Set-Content $LibraryFile -Force
         return $default
     }
 }
 
 function Save-Lib {
     param($d)
-    # FIX: Use -InputObject to prevent pipeline unrolling when saving
-    ConvertTo-Json -InputObject @($d) -Depth 2 -Compress | Set-Content $LibraryFile -Force
+    ConvertTo-Json -InputObject @($d) -Depth 2 | Set-Content $LibraryFile -Force
 }
 
 # --- UI Library Management ---
@@ -84,7 +96,6 @@ if ($Action -eq "GetLibrary") {
     $lib = @(Load-Lib)
     $json = ConvertTo-Json -InputObject $lib -Depth 2 -Compress
 
-    # FIX: Prevent PS5.1 from stripping array brackets on single items
     if ($lib.Count -eq 1 -and $json -notmatch "^\[") {
         $json = "[$json]"
     }
@@ -94,18 +105,22 @@ if ($Action -eq "GetLibrary") {
 }
 
 if ($Action -eq "AddScript") {
-    $lib = @(Load-Lib) # FIX: Force array so += works
+    $lib = @(Load-Lib)
     $newID = if ($lib.Count -gt 0) { ([int]($lib | Select-Object -ExpandProperty ID | Measure-Object -Maximum).Maximum) + 1 } else { 1 }
-    $lib += [PSCustomObject]@{ ID=$newID; Name=$ScriptName.Trim(); Path=$ScriptPath.Trim() }
+
+    $cleanName = $ScriptName.Trim() -replace '[\x00-\x1F]', ''
+    $cleanPath = $ScriptPath.Trim() -replace '[\x00-\x1F]', ''
+
+    $lib += [PSCustomObject]@{ ID=$newID; Name=$cleanName; Path=$cleanPath }
     Save-Lib $lib
 
-    $SafeScriptName = $ScriptName.Trim() -replace '<', '&lt;' -replace '>', '&gt;'
+    $SafeScriptName = Escape-Html $cleanName
     Write-Output "[SDA] [+] Added '$SafeScriptName' to the Custom Script Library."
     return
 }
 
 if ($Action -eq "DeleteScript") {
-    $lib = @(Load-Lib) # FIX: Force array
+    $lib = @(Load-Lib)
     $lib = $lib | Where-Object { $_.ID -ne [int]$ScriptID }
     Save-Lib $lib
     Write-Output "[SDA] [-] Script removed from the Custom Script Library."
@@ -118,9 +133,54 @@ if ($Action -eq "Execute") {
     if ([string]::IsNullOrWhiteSpace($Target)) { Write-Output "[!] ERROR: Target PC(s) required."; return }
     if (-not (Test-Path $ScriptPath)) { Write-Output "[!] ERROR: Cannot read script at $ScriptPath. Verify path and permissions."; return }
 
-    # Sanitize ScriptName for HTML output
-    $SafeScriptName = $ScriptName -replace '<', '&lt;' -replace '>', '&gt;'
+    # --- Security Boundary: Trusted Path Validation ---
+    $resolvedPath = [System.IO.Path]::GetFullPath($ScriptPath)
 
+    # Defense-in-Depth: Prevent UNC path traversal bypasses on older .NET versions
+    if ($resolvedPath -match '\.\.') {
+        Write-Output "<div style='color: var(--accent-danger); font-weight: bold;'><i class='fa-solid fa-shield-halved'></i> SECURITY BLOCK: Execution Aborted</div>"
+        Write-Output "<div style='color: var(--text-secondary); margin-top: 4px;'>Path traversal sequences (..) are not permitted in script paths.</div>"
+        return
+    }
+
+    $isTrusted = $false
+    $trustedRoots = @([System.IO.Path]::GetFullPath($SharedRoot))
+
+    $ConfigFile = Join-Path -Path $SharedRoot -ChildPath "Config\config.json"
+    if (Test-Path $ConfigFile) {
+        try {
+            $Config = Get-Content $ConfigFile -Raw | ConvertFrom-Json
+            if ($Config.AccessControl.TrustedScriptRoots) {
+                foreach ($tr in $Config.AccessControl.TrustedScriptRoots) {
+                    $trustedRoots += [System.IO.Path]::GetFullPath($tr)
+                }
+            }
+        } catch {}
+    }
+
+    foreach ($root in $trustedRoots) {
+        if ($resolvedPath.StartsWith($root, [System.StringComparison]::OrdinalIgnoreCase)) {
+            $isTrusted = $true
+            break
+        }
+    }
+
+    if (-not $isTrusted) {
+        Write-Output "<div style='color: var(--accent-danger); font-weight: bold;'><i class='fa-solid fa-shield-halved'></i> SECURITY BLOCK: Execution Aborted</div>"
+        Write-Output "<div style='color: var(--text-secondary); margin-top: 4px;'>The path <strong>$ScriptPath</strong> is outside the trusted execution boundaries.</div>"
+        Write-Output "<div style='color: var(--text-secondary); margin-top: 4px;'>To allow this, an administrator must add the directory to <strong>TrustedScriptRoots</strong> in <em>\\Config\\config.json</em>.</div>"
+        return
+    }
+
+    # Defense-in-Depth: Explicitly validate file extension to prevent arbitrary binary execution
+    if ([System.IO.Path]::GetExtension($resolvedPath) -ne '.ps1') {
+        Write-Output "<div style='color: var(--accent-danger); font-weight: bold;'><i class='fa-solid fa-shield-halved'></i> SECURITY BLOCK: Execution Aborted</div>"
+        Write-Output "<div style='color: var(--text-secondary); margin-top: 4px;'>Only <strong>.ps1</strong> files are permitted for remote execution.</div>"
+        return
+    }
+    # --- End Security Boundary ---
+
+    $SafeScriptName = Escape-Html $ScriptName
     $PayloadString = Get-Content $ScriptPath -Raw
     $PayloadBlock = [scriptblock]::Create($PayloadString)
 
@@ -147,9 +207,9 @@ if ($Action -eq "Execute") {
                 try {
                     $Bytes = [System.Text.Encoding]::Unicode.GetBytes($PayloadString)
                     $EncodedCommand = [Convert]::ToBase64String($Bytes)
-                    $ArgsList = "/accepteula \\$SingleTarget -s powershell.exe -ExecutionPolicy Bypass -WindowStyle Hidden -EncodedCommand $EncodedCommand"
 
-                    $Output = & $psExecPath $ArgsList 2>&1 | Out-String
+                    # Note: Single-target PsExec is intentionally synchronous to capture output for troubleshooting
+                    $Output = & $psExecPath -accepteula -nobanner \\$SingleTarget -s powershell.exe -ExecutionPolicy Bypass -WindowStyle Hidden -EncodedCommand $EncodedCommand 2>&1 | Out-String
                     Write-Output "`n[SDA SUCCESS] Script Output (via PsExec):`n$Output"
                 } catch { Write-Output "`n[!] FATAL ERROR: Both WinRM and PsExec failed." }
             } else { Write-Output "`n[!] FATAL ERROR: psexec.exe is missing." }
@@ -182,9 +242,15 @@ if ($Action -eq "Execute") {
         $JobResults = Receive-Job $WinRMJob
 		Remove-Job $WinRMJob -Force
 
+        # Logic Fix: Properly separate error lookup from fallback list
+        $WinRMErrorsList = @()
+        foreach ($err in $WinRMErrors) { if ($err.TargetObject) { $WinRMErrorsList += $err.TargetObject.ToString().ToUpper() } }
+
         $FailedWinRM = @()
-        foreach ($err in $WinRMErrors) { if ($err.TargetObject) { $FailedWinRM += $err.TargetObject.ToString().ToUpper() } }
-        foreach ($t in $Online) { if ($FailedWinRM -contains $t.ToUpper()) { $FailedWinRM += $t } else { $SuccessWinRM += $t } }
+        foreach ($t in $Online) { 
+            if ($WinRMErrorsList -contains $t.ToUpper()) { $FailedWinRM += $t } 
+            else { $SuccessWinRM += $t } 
+        }
 
         if ($FailedWinRM.Count -gt 0) {
             Write-Output "`n[3/3] Initiating PsExec fallback for blocked targets..."
@@ -194,7 +260,8 @@ if ($Action -eq "Execute") {
 
                 foreach ($t in $FailedWinRM) {
                     try {
-                        $ArgsList = "/accepteula \\$t -s powershell.exe -ExecutionPolicy Bypass -WindowStyle Hidden -EncodedCommand $EncodedCommand"
+                        # Note: Mass-target PsExec uses -d (detached) to prevent hanging the API Gateway
+                        $ArgsList = "-accepteula -nobanner -d \\$t -s powershell.exe -ExecutionPolicy Bypass -WindowStyle Hidden -EncodedCommand $EncodedCommand"
                         $Process = Start-Process -FilePath $psExecPath -ArgumentList $ArgsList -Wait -WindowStyle Hidden -PassThru
                         if ($Process.ExitCode -eq 0) { $SuccessPsExec += $t } else { $Failed += $t }
                     } catch { $Failed += $t }
@@ -211,8 +278,16 @@ if ($Action -eq "Execute") {
     $html += "<div style='background: #0f172a; padding: 10px; border-radius: 6px; border: 1px solid #334155;'><span style='color: #94a3b8; font-size: 0.85rem;'>Successful Executions</span><br><span style='color: #2ecc71; font-size: 1.2rem; font-weight: bold;'>$TotalSuccess</span></div>"
     $html += "</div>"
 
-    if ($Offline.Count -gt 0) { $html += "<div style='color: #e74c3c; font-size: 0.85rem; margin-top: 8px;'><i class='fa-solid fa-triangle-exclamation'></i> <strong>$($Offline.Count) Offline:</strong> $($Offline -join ', ')</div>" }
-    if ($Failed.Count -gt 0) { $html += "<div style='color: #f1c40f; font-size: 0.85rem; margin-top: 8px;'><i class='fa-solid fa-circle-xmark'></i> <strong>$($Failed.Count) Failed:</strong> $($Failed -join ', ')</div>" }
+    # Defense-in-Depth: Escape HTML for arrays rendered into the UI
+    if ($Offline.Count -gt 0) { 
+        $safeOffline = ($Offline | ForEach-Object { Escape-Html $_ }) -join ', '
+        $html += "<div style='color: #e74c3c; font-size: 0.85rem; margin-top: 8px;'><i class='fa-solid fa-triangle-exclamation'></i> <strong>$($Offline.Count) Offline:</strong> $safeOffline</div>" 
+    }
+    if ($Failed.Count -gt 0) { 
+        $safeFailed = ($Failed | ForEach-Object { Escape-Html $_ }) -join ', '
+        $html += "<div style='color: #f1c40f; font-size: 0.85rem; margin-top: 8px;'><i class='fa-solid fa-circle-xmark'></i> <strong>$($Failed.Count) Failed:</strong> $safeFailed</div>" 
+    }
+
     $html += "</div>"
     Write-Output $html
 
