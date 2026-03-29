@@ -266,10 +266,15 @@
             <div class="modal-header" style="color: var(--accent-danger);"><i class="fa-solid fa-key"></i> Reset AD Password</div>
             <div class="modal-desc">Enter a new password for <strong id="resetTargetUser" style="color: var(--accent-primary);"></strong> or generate a compliant one.</div>
 
-            <div style="display: flex; gap: 10px; margin-bottom: 20px;">
+            <div style="display: flex; gap: 10px; margin-bottom: 16px;">
                 <input type="text" id="newPasswordInput" autocomplete="off" style="flex: 1; padding: 10px; border-radius: 6px; border: 1px solid var(--border-color); background: var(--bg-base); color: var(--text-primary); font-size: 1.1rem; outline: none; font-family: Consolas, monospace; letter-spacing: 1px;" placeholder="Type password here...">
                 <button class="action-btn" style="background: var(--accent-primary); color: white; border: none;" onclick="generatePasswordUI()"><i class="fa-solid fa-dice"></i> Generate</button>
             </div>
+
+            <label style="display: flex; align-items: center; gap: 10px; margin-bottom: 24px; color: var(--text-primary); font-size: 0.9rem; cursor: pointer;">
+                <input type="checkbox" id="forcePasswordChange" checked style="width: 16px; height: 16px;">
+                User must change password at next logon
+            </label>
 
             <div class="modal-actions">
                 <button class="action-btn" onclick="closeModal('passwordResetModal')">Cancel</button>
@@ -772,6 +777,7 @@
             if (!currentTargetUser) { logTelemetry("Please search a Target User first.", "warn"); return; }
             document.getElementById('resetTargetUser').innerText = currentTargetUser;
             document.getElementById('newPasswordInput').value = "";
+            document.getElementById('forcePasswordChange').checked = true;
             document.getElementById('passwordResetModal').style.display = 'flex';
             setTimeout(() => document.getElementById('newPasswordInput').focus(), 100);
         }
@@ -802,6 +808,8 @@
 
         async function submitPasswordReset(btnElement) {
             const pwd = document.getElementById('newPasswordInput').value;
+            const forceChange = document.getElementById('forcePasswordChange').checked;
+
             if (!pwd) { alert("Please enter or generate a password."); return; }
 
             const originalHTML = setButtonLoading(btnElement, true);
@@ -811,7 +819,7 @@
                 const response = await fetch('/api/identity/action', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ Action: 'ResetPassword', TargetUser: currentTargetUser, NewPassword: pwd })
+                    body: JSON.stringify({ Action: 'ResetPassword', TargetUser: currentTargetUser, NewPassword: pwd, ForceChange: forceChange })
                 });
                 const data = await response.json();
                 if (data.status === 'success') { 
