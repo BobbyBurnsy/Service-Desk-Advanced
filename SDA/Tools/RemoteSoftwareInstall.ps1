@@ -41,13 +41,17 @@ param(
 
 $ErrorActionPreference = "Continue"
 
-# --- Path Resolution Fallback ---
+# --- Helper Functions ---
+function Escape-Html([string]$s) {
+    if ([string]::IsNullOrEmpty($s)) { return "" }
+    return $s.Replace('&', '&amp;').Replace('<', '&lt;').Replace('>', '&gt;').Replace('"', '&quot;').Replace("'", '&#39;')
+}
+
 if ([string]::IsNullOrWhiteSpace($SharedRoot)) {
     $ScriptDir = Split-Path -Path $MyInvocation.MyCommand.Path
     $SharedRoot = Split-Path -Path $ScriptDir
 }
 
-# --- Wake-on-LAN Helper ---
 function Send-MagicPacket {
     param([string]$MacAddress)
     try {
@@ -63,7 +67,6 @@ function Send-MagicPacket {
     } catch { return $false }
 }
 
-# --- Export Training Data ---
 if ($GetTrainingData) {
     $data = @{
         StepName = "ZERO-TOUCH SOFTWARE DEPLOYMENT"
@@ -75,7 +78,6 @@ if ($GetTrainingData) {
     return
 }
 
-# --- Library Management ---
 $LibraryFile = Join-Path -Path $SharedRoot -ChildPath "Core\SoftwareLibrary.json"
 $HistoryFile = Join-Path -Path $SharedRoot -ChildPath "Core\UserHistory.json"
 
@@ -85,31 +87,31 @@ function Load-Lib {
             $raw = Get-Content $LibraryFile -Raw -ErrorAction Stop | ConvertFrom-Json
             if ($null -eq $raw) { return @() }
             if ($raw -is [System.Array]) { return $raw } else { return @($raw) }
-        } catch { return @() }
+        } catch { 
+            # Process Stability Fix: Throw instead of exit to prevent killing the API Gateway
+            throw "CRITICAL: SoftwareLibrary.json is corrupted. Aborting to prevent data loss."
+        }
     } else { 
-        # Ensure Core directory exists before writing default
         $CoreDir = Join-Path -Path $SharedRoot -ChildPath "Core"
         if (-not (Test-Path $CoreDir)) { New-Item -ItemType Directory -Path $CoreDir -Force | Out-Null }
 
         $default = @(
             [PSCustomObject]@{ ID=1; Name="Google Chrome (Enterprise)"; Path="\\server\share\Software\GoogleChromeStandaloneEnterprise64.msi"; Args="/qn /norestart" }
         )
-        ConvertTo-Json -InputObject $default -Depth 2 -Compress | Set-Content $LibraryFile -Force
+        ConvertTo-Json -InputObject $default -Depth 2 | Set-Content $LibraryFile -Force
         return $default
     }
 }
 
 function Save-Lib {
     param($d)
-    # FIX: Use -InputObject to prevent pipeline unrolling when saving
-    ConvertTo-Json -InputObject @($d) -Depth 2 -Compress | Set-Content $LibraryFile -Force
+    ConvertTo-Json -InputObject @($d) -Depth 2 | Set-Content $LibraryFile -Force
 }
 
 if ($Action -eq "GetLibrary") {
     $lib = @(Load-Lib)
     $json = ConvertTo-Json -InputObject $lib -Depth 2 -Compress
 
-    # FIX: Prevent PS5.1 from stripping array brackets on single items
     if ($lib.Count -eq 1 -and $json -notmatch "^\[") {
         $json = "[$json]"
     }
@@ -119,23 +121,27 @@ if ($Action -eq "GetLibrary") {
 }
 
 if ($Action -eq "AddApp") {
-    $lib = @(Load-Lib) # FIX: Force array so += works
+    $lib = @(Load-Lib)
     $newID = if ($lib.Count -gt 0) { ([int]($lib | Select-Object -ExpandProperty ID | Measure-Object -Maximum).Maximum) + 1 } else { 1 }
-    $lib += [PSCustomObject]@{ ID=$newID; Name=$AppName.Trim(); Path=$AppPath.Trim(); Args=$AppArgs.Trim() }
+
+    $cleanName = $AppName.Trim() -replace '[\x00-\x1F]', ''
+    $cleanPath = $AppPath.Trim() -replace '[\x00-\x1F]', ''
+    $cleanArgs = if ($AppArgs) { $AppArgs.Trim() -replace '[\x00-\x1F]', '' } else { "" }
+
+    $lib += [PSCustomObject]@{ ID=$newID; Name=$cleanName; Path=$cleanPath; Args=$cleanArgs }
     Save-Lib $lib
-    Write-Output "[SDA] [+] Added '$AppName' to the central Software Library."
+    Write-Output "[SDA] [+] Added '$cleanName' to the central Software Library."
     return
 }
 
 if ($Action -eq "DeleteApp") {
-    $lib = @(Load-Lib) # FIX: Force array
+    $lib = @(Load-Lib)
     $lib = $lib | Where-Object { $_.ID -ne [int]$AppID }
     Save-Lib $lib
     Write-Output "[SDA] [-] Application removed from the central Software Library."
     return
 }
 
-# --- Main Execution ---
 if ($Action -eq "Install") {
 
     if ([string]::IsNullOrWhiteSpace($Target)) { 
@@ -143,12 +149,23 @@ if ($Action -eq "Install") {
         return 
     }
 
-    $SafeAppName = $AppName -replace '<', '&lt;' -replace '>', '&gt;'
+    $SafeAppName = Escape-Html $AppName
     $TargetArray = @($Target -split ',' | ForEach-Object { $_.Trim() } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+
+    # Defense-in-Depth: Explicitly strip interpolation characters ($, ", ', and backticks)
+    $SanitizeRegex = "[`\$`"'``]"
+    $safePath = $AppPath -replace $SanitizeRegex, ''
+    $safeArgs = if ($AppArgs) { $AppArgs -replace $SanitizeRegex, '' } else { "" }
+
+    $b64Path = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($safePath))
+    $b64Args = if ($safeArgs) { [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($safeArgs)) } else { "" }
 
     $PayloadString = @"
         `$ErrorActionPreference = 'SilentlyContinue'
-        `$proc = Start-Process -FilePath `"$AppPath`" -ArgumentList `"$AppArgs`" -Wait -WindowStyle Hidden -PassThru
+        `$decPath = [System.Text.Encoding]::Unicode.GetString([Convert]::FromBase64String('$b64Path'))
+        `$decArgs = if ('$b64Args') { [System.Text.Encoding]::Unicode.GetString([Convert]::FromBase64String('$b64Args')) } else { '' }
+
+        `$proc = Start-Process -FilePath `$decPath -ArgumentList `$decArgs -Wait -WindowStyle Hidden -PassThru
         if (`$proc) { Write-Output `"EXIT_CODE:`$(`$proc.ExitCode)`" }
 "@
 
@@ -157,7 +174,6 @@ if ($Action -eq "Install") {
     $wmiPayload = "powershell.exe -ExecutionPolicy Bypass -WindowStyle Hidden -EncodedCommand $EncodedCommand"
     $psExecPath = Join-Path -Path $SharedRoot -ChildPath "Core\psexec.exe"
 
-    # --- Single Target Deployment ---
     if ($TargetArray.Count -eq 1) {
         $SingleTarget = $TargetArray[0]
         Write-Output "========================================"
@@ -181,11 +197,15 @@ if ($Action -eq "Install") {
                 if ($dbEntry) {
                     Write-Output " > Sending Magic Packet to $($dbEntry.MACAddress)..."
                     Send-MagicPacket -MacAddress $dbEntry.MACAddress | Out-Null
-                    Write-Output " > Waiting 45 seconds for boot..."
-                    Start-Sleep -Seconds 45
-                    if (Test-Connection -ComputerName $SingleTarget -Count 1 -Quiet) {
-                        Write-Output " > [SUCCESS] Target is now awake!"
-                        $Woken = $true
+                    Write-Output " > Waiting for boot (up to 90 seconds)..."
+
+                    for ($i = 0; $i -lt 18; $i++) {
+                        Start-Sleep -Seconds 5
+                        if (Test-Connection -ComputerName $SingleTarget -Count 1 -Quiet) {
+                            Write-Output " > [SUCCESS] Target is now awake!"
+                            $Woken = $true
+                            break
+                        }
                     }
                 } else { Write-Output " > [i] No MAC address found in telemetry. Cannot wake." }
             }
@@ -207,7 +227,7 @@ if ($Action -eq "Install") {
             Write-Output "[!] WinRM Failed. Initiating PsExec Fallback..."
             if (Test-Path $psExecPath) {
                 try {
-                    $ArgsList = "/accepteula \\$SingleTarget -s powershell.exe -ExecutionPolicy Bypass -WindowStyle Hidden -EncodedCommand $EncodedCommand"
+                    $ArgsList = "-accepteula -nobanner -d \\$SingleTarget -s powershell.exe -ExecutionPolicy Bypass -WindowStyle Hidden -EncodedCommand $EncodedCommand"
 
                     $Process = Start-Process -FilePath $psExecPath -ArgumentList $ArgsList -Wait -WindowStyle Hidden -PassThru
                     if ($Process.ExitCode -eq 0) { Write-Output "`n[SDA SUCCESS] Deployment dispatched successfully via PsExec." } 
@@ -223,7 +243,6 @@ if ($Action -eq "Install") {
         return
     }
 
-    # --- Mass Deployment ---
     Write-Output "========================================"
     Write-Output "[SDA] MASS ZERO-TOUCH DEPLOYMENT"
     Write-Output "========================================"
@@ -262,20 +281,23 @@ if ($Action -eq "Install") {
         }
 
         if ($WokeSomeone) {
-            Write-Output " > Waiting 45 seconds for machines to boot..."
-            Start-Sleep -Seconds 45
+            Write-Output " > Waiting for machines to boot (up to 90 seconds)..."
 
-            $StillOffline = @()
-            foreach ($offPC in $Offline) {
-                if (Test-Connection -ComputerName $offPC -Count 1 -Quiet) {
-                    Write-Output " > [SUCCESS] $offPC is now awake!"
-                    $Online += $offPC
-                    $Woken += $offPC
-                } else {
-                    $StillOffline += $offPC
+            for ($i = 0; $i -lt 18; $i++) {
+                Start-Sleep -Seconds 5
+                $StillOffline = @()
+                foreach ($offPC in $Offline) {
+                    if (Test-Connection -ComputerName $offPC -Count 1 -Quiet) {
+                        Write-Output " > [SUCCESS] $offPC is now awake!"
+                        $Online += $offPC
+                        $Woken += $offPC
+                    } else {
+                        $StillOffline += $offPC
+                    }
                 }
+                $Offline = $StillOffline
+                if ($Offline.Count -eq 0) { break }
             }
-            $Offline = $StillOffline
         }
     } else {
         Write-Output "`n[2/4] Skipping Wake-on-LAN (No offline targets or DB missing)."
@@ -293,13 +315,15 @@ if ($Action -eq "Install") {
         $JobResults = Receive-Job $WinRMJob
         Remove-Job $WinRMJob -Force
 
-        $FailedWinRM = @()
+        # Logic Fix: Properly separate error lookup from fallback list
+        $WinRMErrorsList = @()
         foreach ($err in $WinRMErrors) {
-            if ($err.TargetObject) { $FailedWinRM += $err.TargetObject.ToString().ToUpper() }
+            if ($err.TargetObject) { $WinRMErrorsList += $err.TargetObject.ToString().ToUpper() }
         }
 
+        $FailedWinRM = @()
         foreach ($t in $Online) {
-            if ($FailedWinRM -contains $t.ToUpper()) { $FailedWinRM += $t } 
+            if ($WinRMErrorsList -contains $t.ToUpper()) { $FailedWinRM += $t } 
             else { $SuccessWinRM += $t }
         }
 
@@ -310,7 +334,7 @@ if ($Action -eq "Install") {
             if (Test-Path $psExecPath) {
                 foreach ($t in $FailedWinRM) {
                     try {
-                        $ArgsList = "/accepteula \\$t -s powershell.exe -ExecutionPolicy Bypass -WindowStyle Hidden -EncodedCommand $EncodedCommand"
+                        $ArgsList = "-accepteula -nobanner -d \\$t -s powershell.exe -ExecutionPolicy Bypass -WindowStyle Hidden -EncodedCommand $EncodedCommand"
                         $Process = Start-Process -FilePath $psExecPath -ArgumentList $ArgsList -Wait -WindowStyle Hidden -PassThru
                         if ($Process.ExitCode -eq 0) { $SuccessPsExec += $t } else { $Failed += $t }
                     } catch { $Failed += $t }
@@ -331,9 +355,19 @@ if ($Action -eq "Install") {
     $html += "<div style='background: #0f172a; padding: 10px; border-radius: 6px; border: 1px solid #334155;'><span style='color: #94a3b8; font-size: 0.85rem;'>Successful Dispatches</span><br><span style='color: #2ecc71; font-size: 1.2rem; font-weight: bold;'>$TotalSuccess</span></div>"
     $html += "</div>"
 
-    if ($Woken.Count -gt 0) { $html += "<div style='color: #3498db; font-size: 0.85rem; margin-top: 8px;'><i class='fa-solid fa-power-off'></i> <strong>$($Woken.Count) Woken via WoL:</strong> $($Woken -join ', ')</div>" }
-    if ($Offline.Count -gt 0) { $html += "<div style='color: #e74c3c; font-size: 0.85rem; margin-top: 8px;'><i class='fa-solid fa-triangle-exclamation'></i> <strong>$($Offline.Count) Offline:</strong> $($Offline -join ', ')</div>" }
-    if ($Failed.Count -gt 0) { $html += "<div style='color: #f1c40f; font-size: 0.85rem; margin-top: 8px;'><i class='fa-solid fa-circle-xmark'></i> <strong>$($Failed.Count) Failed:</strong> $($Failed -join ', ')</div>" }
+    # Defense-in-Depth: Escape HTML for arrays rendered into the UI
+    if ($Woken.Count -gt 0) { 
+        $safeWoken = ($Woken | ForEach-Object { Escape-Html $_ }) -join ', '
+        $html += "<div style='color: #3498db; font-size: 0.85rem; margin-top: 8px;'><i class='fa-solid fa-power-off'></i> <strong>$($Woken.Count) Woken via WoL:</strong> $safeWoken</div>" 
+    }
+    if ($Offline.Count -gt 0) { 
+        $safeOffline = ($Offline | ForEach-Object { Escape-Html $_ }) -join ', '
+        $html += "<div style='color: #e74c3c; font-size: 0.85rem; margin-top: 8px;'><i class='fa-solid fa-triangle-exclamation'></i> <strong>$($Offline.Count) Offline:</strong> $safeOffline</div>" 
+    }
+    if ($Failed.Count -gt 0) { 
+        $safeFailed = ($Failed | ForEach-Object { Escape-Html $_ }) -join ', '
+        $html += "<div style='color: #f1c40f; font-size: 0.85rem; margin-top: 8px;'><i class='fa-solid fa-circle-xmark'></i> <strong>$($Failed.Count) Failed:</strong> $safeFailed</div>" 
+    }
 
     $html += "</div>"
     Write-Output $html
