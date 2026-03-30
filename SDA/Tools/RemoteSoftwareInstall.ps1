@@ -163,14 +163,16 @@ function Load-Lib {
             if ($raw -is [System.Array]) { return $raw } else { return @($raw) }
         } catch {
             # JSON is malformed — rename the broken file for recovery and start fresh
+            # rather than throwing, which would kill the API gateway response entirely.
             $backupPath = "$LibraryFile.corrupted_$(Get-Date -Format 'yyyyMMdd_HHmmss')"
             Rename-Item -Path $LibraryFile -NewName $backupPath -Force -ErrorAction SilentlyContinue
-            Write-Output "[!] SoftwareLibrary.json was corrupted and has been backed up to $backupPath. A fresh library has been created."
-            # Fall through to create a new default library below
+            Write-Output "[!] SoftwareLibrary.json was corrupted and has been backed up to: $backupPath"
+            Write-Output "[i] A fresh default library will be created now."
+            # Fall through to the creation block below
         }
     }
 
-    # File doesn't exist (or was just renamed away above) — create a fresh default
+    # File doesn't exist, or was just renamed away above — create a fresh default.
     try {
         $CoreDir = Join-Path -Path $SharedRoot -ChildPath "Core"
         if (-not (Test-Path $CoreDir)) { New-Item -ItemType Directory -Path $CoreDir -Force -ErrorAction Stop | Out-Null }
@@ -181,7 +183,8 @@ function Load-Lib {
         ConvertTo-Json -InputObject $default -Depth 2 | Set-Content $LibraryFile -Force -ErrorAction Stop
         return $default
     } catch {
-        # Can't write to disk at all — return empty array so the UI doesn't hang
+        # Can't write to disk at all — return an empty array so GetLibrary still
+        # returns valid JSON and the UI renders instead of spinning forever.
         Write-Output "[!] Could not create SoftwareLibrary.json: $($_.Exception.Message)"
         return @()
     }
