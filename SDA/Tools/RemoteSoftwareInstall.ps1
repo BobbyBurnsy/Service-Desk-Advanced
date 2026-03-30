@@ -9,8 +9,18 @@
     PAYLOAD MODEL (PDQ-style):
     Instead of running the installer directly from a UNC path (which fails due to
     the SYSTEM account double-hop auth problem), this script copies the installer
-    to C:\Windows\Temp on the target machine first, then executes it locally.
+    to C:\Windows\Temp\SDA on the target machine first, then executes it locally.
     This mirrors how PDQ Deploy handles remote installs and is far more reliable.
+
+    TWO-STEP PSEXEC FALLBACK:
+    When WinRM is blocked, the script performs a two-step fallback instead of
+    handing PsExec a UNC path (which SYSTEM cannot reach):
+      Step 1 — The script itself (running as the technician) copies the installer
+               directly to \\TARGET\C$\Windows\Temp\SDA\ via the admin share.
+               No double-hop problem — you have the credentials, not SYSTEM.
+      Step 2 — PsExec then runs as SYSTEM against the already-local file, so it
+               never needs to touch the network at all.
+    This makes the PsExec fallback just as reliable as the WinRM primary path.
 .LINKS
     Website: www.servicedeskadvanced.com
     FAQ: SDA.WTF
@@ -71,6 +81,64 @@ function Send-MagicPacket {
         $udpClient.Close()
         return $true
     } catch { return $false }
+}
+
+# -------------------------------------------------------------------------
+# HELPER: Two-step PsExec fallback
+#
+# Step 1: Copy the installer to the target via the C$ admin share.
+#         This runs as the technician (you), so Kerberos auth works fine.
+#         The destination mirrors the WinRM staging path so the payload
+#         script is identical regardless of which path got it there.
+# Step 2: PsExec launches the local-execute-only payload as SYSTEM.
+#         By this point the installer is already on disk, so SYSTEM never
+#         touches the network — no double-hop, no auth failure.
+#
+# Returns: $true on success, $false on any failure.
+# -------------------------------------------------------------------------
+function Invoke-PsExecFallback {
+    param(
+        [string]$TargetPC,
+        [string]$SourcePath,
+        [string]$FileName,
+        [string]$PsExecPath,
+        [string]$EncodedCommand
+    )
+
+    # Step 1: Pre-stage via admin share (runs as technician, not SYSTEM)
+    $adminShareDest = "\\$TargetPC\C$\Windows\Temp\SDA"
+    $adminShareFile = Join-Path $adminShareDest $FileName
+
+    Write-Output " > [1/2] Pre-staging installer via admin share (\\$TargetPC\C$)..."
+    try {
+        if (-not (Test-Path $adminShareDest)) {
+            New-Item -ItemType Directory -Path $adminShareDest -Force -ErrorAction Stop | Out-Null
+        }
+        Copy-Item -Path $SourcePath -Destination $adminShareFile -Force -ErrorAction Stop
+        Write-Output " > [1/2] Installer copied successfully to $adminShareDest"
+    } catch {
+        Write-Output " > [!] Admin share copy failed for $TargetPC — $($_.Exception.Message)"
+        return $false
+    }
+
+    # Step 2: PsExec runs the local-execute payload as SYSTEM.
+    # The EncodedCommand payload will find the file already on disk at
+    # C:\Windows\Temp\SDA\$FileName and skip straight to the install.
+    Write-Output " > [2/2] Launching installer via PsExec (SYSTEM, local path)..."
+    try {
+        $ArgsList = "-accepteula -nobanner -d \\$TargetPC -s powershell.exe -ExecutionPolicy Bypass -WindowStyle Hidden -EncodedCommand $EncodedCommand"
+        $Process = Start-Process -FilePath $PsExecPath -ArgumentList $ArgsList -Wait -WindowStyle Hidden -PassThru
+        if ($Process.ExitCode -eq 0) {
+            Write-Output " > [2/2] PsExec dispatched successfully."
+            return $true
+        } else {
+            Write-Output " > [!] PsExec returned exit code $($Process.ExitCode) for $TargetPC."
+            return $false
+        }
+    } catch {
+        Write-Output " > [!] PsExec threw an exception for $TargetPC — $($_.Exception.Message)"
+        return $false
+    }
 }
 
 if ($GetTrainingData) {
@@ -297,26 +365,24 @@ if ($Action -eq "Install") {
             Write-Output "`n[SDA SUCCESS] Installer staged and launched successfully via WinRM."
             Write-Output "[i] Installation is running silently in the background on $SingleTarget."
         } catch {
-            # --- Fallback path: PsExec ---
-            # PsExec runs as SYSTEM, which cannot reach UNC shares. However, the
-            # payload's Copy-Item step will fail gracefully ($ErrorActionPreference
-            # = SilentlyContinue), and if the file was pre-staged by a prior WinRM
-            # attempt, the install may still succeed. In a full PsExec-only scenario,
-            # pre-copy the installer to the target via a separate admin share copy.
-            Write-Output "[!] WinRM Failed. Initiating PsExec Fallback..."
-            Write-Output " > Note: PsExec runs as SYSTEM. If the installer was not already"
-            Write-Output " > staged, the copy step will fail. Pre-stage via admin share if needed."
+            # --- Fallback path: Two-step admin share pre-stage + PsExec ---
+            # The script (running as you) copies the installer to \\TARGET\C$\...,
+            # then PsExec runs the payload as SYSTEM against the already-local file.
+            Write-Output "[!] WinRM failed. Initiating two-step PsExec fallback..."
             if (Test-Path $psExecPath) {
-                try {
-                    $ArgsList = "-accepteula -nobanner -d \\$SingleTarget -s powershell.exe -ExecutionPolicy Bypass -WindowStyle Hidden -EncodedCommand $EncodedCommand"
-                    $Process = Start-Process -FilePath $psExecPath -ArgumentList $ArgsList -Wait -WindowStyle Hidden -PassThru
-                    if ($Process.ExitCode -eq 0) {
-                        Write-Output "`n[SDA SUCCESS] Deployment dispatched via PsExec."
-                        Write-Output "[i] Installation is running silently in the background on $SingleTarget."
-                    } else {
-                        Write-Output "`n[!] ERROR: PsExec returned exit code $($Process.ExitCode)."
-                    }
-                } catch { Write-Output "`n[!] FATAL ERROR: Both WinRM and PsExec failed." }
+                $fallbackOK = Invoke-PsExecFallback `
+                    -TargetPC      $SingleTarget `
+                    -SourcePath    $safePath `
+                    -FileName      $installerFileName `
+                    -PsExecPath    $psExecPath `
+                    -EncodedCommand $EncodedCommand
+
+                if ($fallbackOK) {
+                    Write-Output "`n[SDA SUCCESS] Deployment dispatched via PsExec fallback."
+                    Write-Output "[i] Installation is running silently in the background on $SingleTarget."
+                } else {
+                    Write-Output "`n[!] FATAL ERROR: Both WinRM and PsExec fallback failed for $SingleTarget."
+                }
             } else { Write-Output "`n[!] FATAL ERROR: psexec.exe is missing from \Core." }
         }
 
@@ -419,15 +485,19 @@ if ($Action -eq "Install") {
         Write-Output " > WinRM Success: $($SuccessWinRM.Count) | WinRM Blocked: $($FailedWinRM.Count)"
 
         if ($FailedWinRM.Count -gt 0) {
-            Write-Output "`n[4/4] Initiating PsExec fallback for WinRM-blocked targets..."
-            Write-Output " > PsExec targets will attempt install from staged path if already copied."
+            Write-Output "`n[4/4] Initiating two-step PsExec fallback for WinRM-blocked targets..."
+            Write-Output " > Script will pre-stage via C$ admin share, then PsExec executes locally."
             if (Test-Path $psExecPath) {
                 foreach ($t in $FailedWinRM) {
-                    try {
-                        $ArgsList = "-accepteula -nobanner -d \\$t -s powershell.exe -ExecutionPolicy Bypass -WindowStyle Hidden -EncodedCommand $EncodedCommand"
-                        $Process = Start-Process -FilePath $psExecPath -ArgumentList $ArgsList -Wait -WindowStyle Hidden -PassThru
-                        if ($Process.ExitCode -eq 0) { $SuccessPsExec += $t } else { $Failed += $t }
-                    } catch { $Failed += $t }
+                    Write-Output " > Processing $t..."
+                    $fallbackOK = Invoke-PsExecFallback `
+                        -TargetPC       $t `
+                        -SourcePath     $safePath `
+                        -FileName       $installerFileName `
+                        -PsExecPath     $psExecPath `
+                        -EncodedCommand $EncodedCommand
+
+                    if ($fallbackOK) { $SuccessPsExec += $t } else { $Failed += $t }
                 }
             } else {
                 Write-Output " > [!] psexec.exe missing. Cannot process fallbacks."
