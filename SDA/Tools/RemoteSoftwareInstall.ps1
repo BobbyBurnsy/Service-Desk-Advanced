@@ -162,17 +162,28 @@ function Load-Lib {
             if ($null -eq $raw) { return @() }
             if ($raw -is [System.Array]) { return $raw } else { return @($raw) }
         } catch {
-            throw "CRITICAL: SoftwareLibrary.json is corrupted. Aborting to prevent data loss."
+            # JSON is malformed — rename the broken file for recovery and start fresh
+            $backupPath = "$LibraryFile.corrupted_$(Get-Date -Format 'yyyyMMdd_HHmmss')"
+            Rename-Item -Path $LibraryFile -NewName $backupPath -Force -ErrorAction SilentlyContinue
+            Write-Output "[!] SoftwareLibrary.json was corrupted and has been backed up to $backupPath. A fresh library has been created."
+            # Fall through to create a new default library below
         }
-    } else {
+    }
+
+    # File doesn't exist (or was just renamed away above) — create a fresh default
+    try {
         $CoreDir = Join-Path -Path $SharedRoot -ChildPath "Core"
-        if (-not (Test-Path $CoreDir)) { New-Item -ItemType Directory -Path $CoreDir -Force | Out-Null }
+        if (-not (Test-Path $CoreDir)) { New-Item -ItemType Directory -Path $CoreDir -Force -ErrorAction Stop | Out-Null }
 
         $default = @(
             [PSCustomObject]@{ ID=1; Name="Google Chrome (Enterprise)"; Path="\\server\share\Software\GoogleChromeStandaloneEnterprise64.msi"; Args="/qn /norestart" }
         )
-        ConvertTo-Json -InputObject $default -Depth 2 | Set-Content $LibraryFile -Force
+        ConvertTo-Json -InputObject $default -Depth 2 | Set-Content $LibraryFile -Force -ErrorAction Stop
         return $default
+    } catch {
+        # Can't write to disk at all — return empty array so the UI doesn't hang
+        Write-Output "[!] Could not create SoftwareLibrary.json: $($_.Exception.Message)"
+        return @()
     }
 }
 
