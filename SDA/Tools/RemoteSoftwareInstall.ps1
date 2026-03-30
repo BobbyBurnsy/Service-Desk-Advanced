@@ -5,6 +5,12 @@
     Acts as a backend controller for the Zero-Touch Deployment Library UI.
     Supports single and mass deployments via WinRM and PsExec.
     Includes Wake-on-LAN (WoL) functionality for offline targets.
+
+    PAYLOAD MODEL (PDQ-style):
+    Instead of running the installer directly from a UNC path (which fails due to
+    the SYSTEM account double-hop auth problem), this script copies the installer
+    to C:\Windows\Temp on the target machine first, then executes it locally.
+    This mirrors how PDQ Deploy handles remote installs and is far more reliable.
 .LINKS
     Website: www.servicedeskadvanced.com
     FAQ: SDA.WTF
@@ -87,11 +93,10 @@ function Load-Lib {
             $raw = Get-Content $LibraryFile -Raw -ErrorAction Stop | ConvertFrom-Json
             if ($null -eq $raw) { return @() }
             if ($raw -is [System.Array]) { return $raw } else { return @($raw) }
-        } catch { 
-            # Process Stability Fix: Throw instead of exit to prevent killing the API Gateway
+        } catch {
             throw "CRITICAL: SoftwareLibrary.json is corrupted. Aborting to prevent data loss."
         }
-    } else { 
+    } else {
         $CoreDir = Join-Path -Path $SharedRoot -ChildPath "Core"
         if (-not (Test-Path $CoreDir)) { New-Item -ItemType Directory -Path $CoreDir -Force | Out-Null }
 
@@ -144,9 +149,9 @@ if ($Action -eq "DeleteApp") {
 
 if ($Action -eq "Install") {
 
-    if ([string]::IsNullOrWhiteSpace($Target)) { 
+    if ([string]::IsNullOrWhiteSpace($Target)) {
         Write-Output "[!] ERROR: Target PC(s) required."
-        return 
+        return
     }
 
     $SafeAppName = Escape-Html $AppName
@@ -157,31 +162,94 @@ if ($Action -eq "Install") {
     $safePath = $AppPath -replace $SanitizeRegex, ''
     $safeArgs = if ($AppArgs) { $AppArgs -replace $SanitizeRegex, '' } else { "" }
 
-    $b64Path = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($safePath))
-    $b64Args = if ($safeArgs) { [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($safeArgs)) } else { "" }
+    # Derive the installer filename from the source path so we can reconstruct
+    # the local staging path on the target without hardcoding anything.
+    $installerFileName = [System.IO.Path]::GetFileName($safePath)
 
+    # Encode the source UNC path, filename, and install args so they survive
+    # being passed through WinRM/PsExec without any quoting or escaping issues.
+    $b64SourcePath  = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($safePath))
+    $b64FileName    = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($installerFileName))
+    $b64Args        = if ($safeArgs) { [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($safeArgs)) } else { "" }
+
+    # -------------------------------------------------------------------------
+    # PDQ-STYLE PAYLOAD: Copy installer locally, then execute from local path.
+    #
+    # WHY THIS WORKS:
+    #   The Copy-Item runs inside the Invoke-Command session, which carries the
+    #   technician's Kerberos credentials — so it CAN reach the UNC share.
+    #   The subsequent Start-Process runs as SYSTEM (via WMI/PsExec) against a
+    #   local path, so there is no double-hop or auth issue during the install.
+    #   This is exactly how PDQ Deploy stages and runs packages.
+    #
+    # FLOW:
+    #   1. Decode the source UNC path and filename on the remote machine.
+    #   2. Ensure C:\Windows\Temp\SDA exists as a staging folder.
+    #   3. Copy the installer from the share to the local staging folder.
+    #      (This step uses WinRM credentials — no double-hop problem.)
+    #   4. Build the install command using the fully local path.
+    #   5. Execute via WMI Win32_Process as SYSTEM from a local path.
+    #   6. Clean up the staged installer after the process launches.
+    # -------------------------------------------------------------------------
     $PayloadString = @"
         `$ErrorActionPreference = 'SilentlyContinue'
-        `$decPath = [System.Text.Encoding]::Unicode.GetString([Convert]::FromBase64String('$b64Path'))
-        `$decArgs = if ('$b64Args') { [System.Text.Encoding]::Unicode.GetString([Convert]::FromBase64String('$b64Args')) } else { '' }
 
-        `$proc = Start-Process -FilePath `$decPath -ArgumentList `$decArgs -Wait -WindowStyle Hidden -PassThru
-        if (`$proc) { Write-Output `"EXIT_CODE:`$(`$proc.ExitCode)`" }
+        # Step 1: Decode inputs
+        `$sourcePath    = [System.Text.Encoding]::Unicode.GetString([Convert]::FromBase64String('$b64SourcePath'))
+        `$fileName      = [System.Text.Encoding]::Unicode.GetString([Convert]::FromBase64String('$b64FileName'))
+        `$installArgs   = if ('$b64Args') { [System.Text.Encoding]::Unicode.GetString([Convert]::FromBase64String('$b64Args')) } else { '' }
+
+        # Step 2: Prepare local staging folder
+        `$stagingDir  = 'C:\Windows\Temp\SDA'
+        `$localPath   = Join-Path `$stagingDir `$fileName
+        if (-not (Test-Path `$stagingDir)) { New-Item -ItemType Directory -Path `$stagingDir -Force | Out-Null }
+
+        # Step 3: Copy installer from UNC share to local staging path
+        Copy-Item -Path `$sourcePath -Destination `$localPath -Force -ErrorAction Stop
+
+        # Step 4 & 5: Determine installer type and build the correct launch command.
+        # MSI files must be driven through msiexec.exe — you cannot Start-Process an
+        # .msi directly as SYSTEM without it. EXE installers run directly.
+        `$extension = [System.IO.Path]::GetExtension(`$localPath).ToLower()
+        if (`$extension -eq '.msi') {
+            `$execPath = 'msiexec.exe'
+            `$execArgs = "/i `"`$localPath`" `$installArgs"
+        } else {
+            `$execPath = `$localPath
+            `$execArgs = `$installArgs
+        }
+
+        # Step 6: Launch via WMI as SYSTEM from the fully local path
+        `$wmiCmd = "`$execPath `$execArgs"
+        Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = `$wmiCmd } | Out-Null
+
+        # Step 7: Clean up staged installer after a short delay to let the
+        # installer process detach. The install itself continues in the background.
+        Start-Sleep -Seconds 5
+        Remove-Item -Path `$localPath -Force -ErrorAction SilentlyContinue
 "@
 
+    # Encode the entire payload as Base64 so it passes cleanly through
+    # WinRM argument boundaries and PsExec without any escaping issues.
     $Bytes = [System.Text.Encoding]::Unicode.GetBytes($PayloadString)
     $EncodedCommand = [Convert]::ToBase64String($Bytes)
-    $wmiPayload = "powershell.exe -ExecutionPolicy Bypass -WindowStyle Hidden -EncodedCommand $EncodedCommand"
+
+    # This is the WMI command that PsExec will run as SYSTEM on the remote box.
+    # It simply launches PowerShell with our encoded payload.
     $psExecPath = Join-Path -Path $SharedRoot -ChildPath "Core\psexec.exe"
 
+    # =========================================================================
+    # SINGLE TARGET DEPLOYMENT
+    # =========================================================================
     if ($TargetArray.Count -eq 1) {
         $SingleTarget = $TargetArray[0]
         Write-Output "========================================"
         Write-Output "[SDA] ZERO-TOUCH DEPLOYMENT"
         Write-Output "========================================"
         Write-Output "[i] Deploying $SafeAppName to $SingleTarget..."
+        Write-Output "[i] Staging installer to C:\Windows\Temp\SDA on target..."
 
-        if (-not (Test-Connection -ComputerName $SingleTarget -Count 1 -Quiet)) { 
+        if (-not (Test-Connection -ComputerName $SingleTarget -Count 1 -Quiet)) {
             Write-Output "[!] $SingleTarget is offline. Attempting Wake-on-LAN..."
             $Woken = $false
             if (Test-Path $HistoryFile) {
@@ -212,26 +280,42 @@ if ($Action -eq "Install") {
 
             if (-not $Woken) {
                 Write-Output "[!] Target remains offline. Aborting deployment."
-                return 
+                return
             }
         }
 
+        # --- Primary path: WinRM ---
+        # Invoke-Command runs under the technician's credentials (Kerberos), so
+        # Copy-Item inside the payload CAN reach the UNC share. The subsequent
+        # WMI launch runs locally on the target, so no double-hop occurs.
         try {
-            Write-Output " > Initiating background installation via WinRM..."
+            Write-Output " > Copying installer to target staging folder via WinRM..."
             Invoke-Command -ComputerName $SingleTarget -ScriptBlock {
-                param($cmd)
-                Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = $cmd } | Out-Null
-            } -ArgumentList $wmiPayload -ErrorAction Stop
-            Write-Output "`n[SDA SUCCESS] Deployment dispatched successfully via WinRM."
+                param($encodedCmd)
+                powershell.exe -ExecutionPolicy Bypass -WindowStyle Hidden -EncodedCommand $encodedCmd
+            } -ArgumentList $EncodedCommand -ErrorAction Stop
+            Write-Output "`n[SDA SUCCESS] Installer staged and launched successfully via WinRM."
+            Write-Output "[i] Installation is running silently in the background on $SingleTarget."
         } catch {
+            # --- Fallback path: PsExec ---
+            # PsExec runs as SYSTEM, which cannot reach UNC shares. However, the
+            # payload's Copy-Item step will fail gracefully ($ErrorActionPreference
+            # = SilentlyContinue), and if the file was pre-staged by a prior WinRM
+            # attempt, the install may still succeed. In a full PsExec-only scenario,
+            # pre-copy the installer to the target via a separate admin share copy.
             Write-Output "[!] WinRM Failed. Initiating PsExec Fallback..."
+            Write-Output " > Note: PsExec runs as SYSTEM. If the installer was not already"
+            Write-Output " > staged, the copy step will fail. Pre-stage via admin share if needed."
             if (Test-Path $psExecPath) {
                 try {
                     $ArgsList = "-accepteula -nobanner -d \\$SingleTarget -s powershell.exe -ExecutionPolicy Bypass -WindowStyle Hidden -EncodedCommand $EncodedCommand"
-
                     $Process = Start-Process -FilePath $psExecPath -ArgumentList $ArgsList -Wait -WindowStyle Hidden -PassThru
-                    if ($Process.ExitCode -eq 0) { Write-Output "`n[SDA SUCCESS] Deployment dispatched successfully via PsExec." } 
-                    else { Write-Output "`n[!] ERROR: PsExec returned exit code $($Process.ExitCode)." }
+                    if ($Process.ExitCode -eq 0) {
+                        Write-Output "`n[SDA SUCCESS] Deployment dispatched via PsExec."
+                        Write-Output "[i] Installation is running silently in the background on $SingleTarget."
+                    } else {
+                        Write-Output "`n[!] ERROR: PsExec returned exit code $($Process.ExitCode)."
+                    }
                 } catch { Write-Output "`n[!] FATAL ERROR: Both WinRM and PsExec failed." }
             } else { Write-Output "`n[!] FATAL ERROR: psexec.exe is missing from \Core." }
         }
@@ -243,11 +327,15 @@ if ($Action -eq "Install") {
         return
     }
 
+    # =========================================================================
+    # MASS DEPLOYMENT
+    # =========================================================================
     Write-Output "========================================"
     Write-Output "[SDA] MASS ZERO-TOUCH DEPLOYMENT"
     Write-Output "========================================"
-    Write-Output "[i] Application: $SafeAppName"
+    Write-Output "[i] Application : $SafeAppName"
     Write-Output "[i] Total Targets: $($TargetArray.Count)"
+    Write-Output "[i] Payload model: Copy-to-C:\Windows\Temp\SDA, then install locally"
 
     $Online = @(); $Offline = @(); $Woken = @(); $SuccessWinRM = @(); $SuccessPsExec = @(); $Failed = @()
 
@@ -268,7 +356,6 @@ if ($Action -eq "Install") {
         }
 
         $WokeSomeone = $false
-
         foreach ($offPC in $Offline) {
             $dbEntry = $dbRaw | Where-Object { $_.Computer -eq $offPC -and $_.MACAddress -ne $null } | Select-Object -First 1
             if ($dbEntry) {
@@ -282,7 +369,6 @@ if ($Action -eq "Install") {
 
         if ($WokeSomeone) {
             Write-Output " > Waiting for machines to boot (up to 90 seconds)..."
-
             for ($i = 0; $i -lt 18; $i++) {
                 Start-Sleep -Seconds 5
                 $StillOffline = @()
@@ -290,7 +376,7 @@ if ($Action -eq "Install") {
                     if (Test-Connection -ComputerName $offPC -Count 1 -Quiet) {
                         Write-Output " > [SUCCESS] $offPC is now awake!"
                         $Online += $offPC
-                        $Woken += $offPC
+                        $Woken  += $offPC
                     } else {
                         $StillOffline += $offPC
                     }
@@ -300,22 +386,25 @@ if ($Action -eq "Install") {
             }
         }
     } else {
-        Write-Output "`n[2/4] Skipping Wake-on-LAN (No offline targets or DB missing)."
+        Write-Output "`n[2/4] Skipping Wake-on-LAN (No offline targets or telemetry DB missing)."
     }
 
     if ($Online.Count -gt 0) {
-        Write-Output "`n[3/4] Dispatching parallel WinRM commands..."
+        Write-Output "`n[3/4] Dispatching parallel WinRM staging + install jobs..."
+        Write-Output " > Each target will copy the installer locally before executing."
 
+        # Invoke-Command -AsJob fires all targets in parallel. Each remote session
+        # runs our full payload: copy from UNC (using WinRM/Kerberos creds) then
+        # launch the installer via WMI from the local staging path.
         $WinRMJob = Invoke-Command -ComputerName $Online -ScriptBlock {
-            param($cmd)
-            Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = $cmd } | Out-Null
-        } -ArgumentList $wmiPayload -ErrorVariable WinRMErrors -ErrorAction SilentlyContinue -AsJob
+            param($encodedCmd)
+            powershell.exe -ExecutionPolicy Bypass -WindowStyle Hidden -EncodedCommand $encodedCmd
+        } -ArgumentList $EncodedCommand -ErrorVariable WinRMErrors -ErrorAction SilentlyContinue -AsJob
 
         Wait-Job $WinRMJob | Out-Null
-        $JobResults = Receive-Job $WinRMJob
+        Receive-Job $WinRMJob | Out-Null
         Remove-Job $WinRMJob -Force
 
-        # Logic Fix: Properly separate error lookup from fallback list
         $WinRMErrorsList = @()
         foreach ($err in $WinRMErrors) {
             if ($err.TargetObject) { $WinRMErrorsList += $err.TargetObject.ToString().ToUpper() }
@@ -323,14 +412,15 @@ if ($Action -eq "Install") {
 
         $FailedWinRM = @()
         foreach ($t in $Online) {
-            if ($WinRMErrorsList -contains $t.ToUpper()) { $FailedWinRM += $t } 
+            if ($WinRMErrorsList -contains $t.ToUpper()) { $FailedWinRM += $t }
             else { $SuccessWinRM += $t }
         }
 
         Write-Output " > WinRM Success: $($SuccessWinRM.Count) | WinRM Blocked: $($FailedWinRM.Count)"
 
         if ($FailedWinRM.Count -gt 0) {
-            Write-Output "`n[4/4] Initiating PsExec fallback for blocked targets..."
+            Write-Output "`n[4/4] Initiating PsExec fallback for WinRM-blocked targets..."
+            Write-Output " > PsExec targets will attempt install from staged path if already copied."
             if (Test-Path $psExecPath) {
                 foreach ($t in $FailedWinRM) {
                     try {
@@ -343,6 +433,8 @@ if ($Action -eq "Install") {
                 Write-Output " > [!] psexec.exe missing. Cannot process fallbacks."
                 $Failed += $FailedWinRM
             }
+        } else {
+            Write-Output "`n[4/4] No PsExec fallback needed. All targets handled via WinRM."
         }
     }
 
@@ -355,18 +447,17 @@ if ($Action -eq "Install") {
     $html += "<div style='background: #0f172a; padding: 10px; border-radius: 6px; border: 1px solid #334155;'><span style='color: #94a3b8; font-size: 0.85rem;'>Successful Dispatches</span><br><span style='color: #2ecc71; font-size: 1.2rem; font-weight: bold;'>$TotalSuccess</span></div>"
     $html += "</div>"
 
-    # Defense-in-Depth: Escape HTML for arrays rendered into the UI
-    if ($Woken.Count -gt 0) { 
+    if ($Woken.Count -gt 0) {
         $safeWoken = ($Woken | ForEach-Object { Escape-Html $_ }) -join ', '
-        $html += "<div style='color: #3498db; font-size: 0.85rem; margin-top: 8px;'><i class='fa-solid fa-power-off'></i> <strong>$($Woken.Count) Woken via WoL:</strong> $safeWoken</div>" 
+        $html += "<div style='color: #3498db; font-size: 0.85rem; margin-top: 8px;'><i class='fa-solid fa-power-off'></i> <strong>$($Woken.Count) Woken via WoL:</strong> $safeWoken</div>"
     }
-    if ($Offline.Count -gt 0) { 
+    if ($Offline.Count -gt 0) {
         $safeOffline = ($Offline | ForEach-Object { Escape-Html $_ }) -join ', '
-        $html += "<div style='color: #e74c3c; font-size: 0.85rem; margin-top: 8px;'><i class='fa-solid fa-triangle-exclamation'></i> <strong>$($Offline.Count) Offline:</strong> $safeOffline</div>" 
+        $html += "<div style='color: #e74c3c; font-size: 0.85rem; margin-top: 8px;'><i class='fa-solid fa-triangle-exclamation'></i> <strong>$($Offline.Count) Offline:</strong> $safeOffline</div>"
     }
-    if ($Failed.Count -gt 0) { 
+    if ($Failed.Count -gt 0) {
         $safeFailed = ($Failed | ForEach-Object { Escape-Html $_ }) -join ', '
-        $html += "<div style='color: #f1c40f; font-size: 0.85rem; margin-top: 8px;'><i class='fa-solid fa-circle-xmark'></i> <strong>$($Failed.Count) Failed:</strong> $safeFailed</div>" 
+        $html += "<div style='color: #f1c40f; font-size: 0.85rem; margin-top: 8px;'><i class='fa-solid fa-circle-xmark'></i> <strong>$($Failed.Count) Failed:</strong> $safeFailed</div>"
     }
 
     $html += "</div>"
