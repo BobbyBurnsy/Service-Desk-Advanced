@@ -4,6 +4,7 @@
 .DESCRIPTION
     Safely manages the central UserHistory.json database by 
     finding and deleting a specific User-to-PC mapping.
+    Enforces strict schema validation to prevent PS 5.1 serialization bugs.
 .LINKS
     Website: www.servicedeskadvanced.com
     FAQ: SDA.WTF
@@ -49,6 +50,7 @@ $db = @{}
 $initialCount = 0
 
 if (Test-Path $HistoryFile) {
+    # Backup if the file is healthy (>100 bytes).
     if ((Get-Item $HistoryFile).Length -gt 100) {
         Copy-Item -Path $HistoryFile -Destination $BackupFile -Force
     }
@@ -85,10 +87,13 @@ if ($db.ContainsKey($scanKey)) {
     return
 }
 
-# --- Write to Disk ---
+# --- Write to Disk (Strict Schema Enforcement) ---
 if ($db.Count -eq $expectedCount -and $initialCount -gt 0) {
     try {
-        $finalList = @($db.Values | Sort-Object User)
+        # PS 5.1 Bug Fix: Force all objects to have the exact same properties before JSON conversion
+        $finalList = @($db.Values | Sort-Object User | Select-Object User, Computer, LastSeen, Source, MACAddress)
+
+        # Removed -Compress to restore pretty-printing
         $jsonOutput = ConvertTo-Json -InputObject $finalList -Depth 3 -ErrorAction Stop
 
         if ([string]::IsNullOrWhiteSpace($jsonOutput)) {
@@ -98,6 +103,7 @@ if ($db.Count -eq $expectedCount -and $initialCount -gt 0) {
         Set-Content -Path $TempFile -Value $jsonOutput -Force -ErrorAction Stop
         Move-Item -Path $TempFile -Destination $HistoryFile -Force -ErrorAction Stop
 
+        Write-Output "[SDA SUCCESS] Database updated successfully."
     } catch {
         Write-Output "`n[!] ERROR SAVING: $($_.Exception.Message)"
         if (Test-Path $TempFile) { Remove-Item $TempFile -Force -ErrorAction SilentlyContinue }
