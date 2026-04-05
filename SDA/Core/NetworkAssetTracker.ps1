@@ -70,8 +70,11 @@ function Save-Database {
 
     if ($db.Count -ge $initialCount -and $db.Count -gt 0) {
         try {
-            $list = @($db.Values | Sort-Object User)
-            $json = ConvertTo-Json -InputObject $list -Depth 3 -Compress -ErrorAction Stop
+            # STRICT SCHEMA ENFORCEMENT: Prevents PS 5.1 from dropping MAC Addresses
+            $list = @($db.Values | Sort-Object User | Select-Object User, Computer, LastSeen, Source, MACAddress)
+
+            # Removed -Compress to restore pretty-printing for manual auditing
+            $json = ConvertTo-Json -InputObject $list -Depth 3 -ErrorAction Stop
 
             # PS 5.1 Single-Item Array Protection
             if ($list.Count -eq 1 -and $json -notmatch "^\s*\[") { $json = "[$json]" }
