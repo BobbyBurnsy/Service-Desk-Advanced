@@ -79,10 +79,10 @@ foreach ($Module in $RequiredModules) {
     } else {
         Write-Host " > Installing $Module (This may take a moment)..." -ForegroundColor Yellow
         try {
-            Install-Module -Name $Module -Force -AllowClobber -AcceptLicense
+            Install-Module -Name $Module -Force -AllowClobber
             Write-Host "   -> Success." -ForegroundColor Green
         } catch {
-            Write-Host "   -> [!] Failed to install $Module: $($_.Exception.Message)" -ForegroundColor Red
+            Write-Host "   -> [!] Failed to install $Module : $($_.Exception.Message)" -ForegroundColor Red
         }
     }
 }
